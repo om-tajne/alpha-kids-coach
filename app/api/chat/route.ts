@@ -1,9 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
+import { GoogleGenAI } from "@google/genai";
 import OpenAI from "openai";
-
-const client = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY,
-});
 
 const SYSTEM_PROMPT = `You are Zara, a warm, friendly AI parenting coach for Alpha Kids — a service for parents in India, Pakistan and the Gulf. You respond in the same language the parent uses (English or Urdu). You are NOT a doctor, therapist, lawyer, or medical professional.
 
@@ -31,7 +28,7 @@ CORE RULES (non-negotiable):
 
 3. NO MEDICAL OR LEGAL INSTRUCTIONS: Never prescribe medication, dosage, or legal steps. Always refer to a qualified professional.
 
-4. STAY BRIEF & PRACTICAL: Keep replies under 250 words. Use simple, warm language a tired parent can read in 30 seconds.
+4. STAY BRIEF & PRACTICAL: Keep replies under 180 words. Use simple, warm language a tired parent can read in 20 seconds.
 
 5. STRUCTURED RESPONSE FORMAT (for non-emergency situations):
    Always reply in this structure:
@@ -67,47 +64,86 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    if (!process.env.OPENAI_API_KEY) {
+    const geminiKey = process.env.GEMINI_API_KEY;
+    const openaiKey = process.env.OPENAI_API_KEY;
+
+    if (!geminiKey && !openaiKey) {
       return NextResponse.json(
-        { error: "OpenAI API key not configured. Please add OPENAI_API_KEY to your .env.local file." },
+        { error: "No API key configured. Please set GEMINI_API_KEY or OPENAI_API_KEY in .env.local." },
         { status: 500 }
       );
     }
 
-    const completion = await client.chat.completions.create({
-      model: "gpt-4o-mini",
-      messages: [
-        { role: "system", content: SYSTEM_PROMPT },
-        ...messages,
-      ],
-      max_tokens: 500,
-      temperature: 0.7,
-    });
+    const encoder = new TextEncoder();
 
-    const reply = completion.choices[0]?.message?.content ?? "";
+    // Prefer ultra-fast Gemini 3.5 Flash Lite with streaming
+    if (geminiKey) {
+      const ai = new GoogleGenAI({ apiKey: geminiKey });
+      
+      const formattedContents = messages.map((m) => ({
+        role: m.role === "assistant" ? "model" : "user",
+        parts: [{ text: m.content }],
+      }));
 
-    return NextResponse.json({ reply });
-  } catch (error: unknown) {
-    console.error("Chat API error:", error);
-    
-    if (error instanceof OpenAI.APIError) {
-      if (error.status === 401) {
-        return NextResponse.json(
-          { error: "Invalid API key. Please check your OPENAI_API_KEY." },
-          { status: 401 }
-        );
-      }
-      if (error.status === 429) {
-        return NextResponse.json(
-          { error: "Rate limit reached. Please wait a moment and try again." },
-          { status: 429 }
-        );
-      }
+      const stream = new ReadableStream({
+        async start(controller) {
+          try {
+            const resStream = await ai.models.generateContentStream({
+              model: "gemini-3.5-flash-lite",
+              config: {
+                systemInstruction: SYSTEM_PROMPT,
+                maxOutputTokens: 350,
+                temperature: 0.7,
+              },
+              contents: formattedContents,
+            });
+
+            for await (const chunk of resStream) {
+              if (chunk.text) {
+                controller.enqueue(encoder.encode(chunk.text));
+              }
+            }
+            controller.close();
+          } catch (err: unknown) {
+            console.error("Gemini stream error:", err);
+            const msg = err instanceof Error ? err.message : "Stream error";
+            controller.enqueue(encoder.encode(`\n⚠️ Error: ${msg}`));
+            controller.close();
+          }
+        },
+      });
+
+      return new Response(stream, {
+        headers: {
+          "Content-Type": "text/plain; charset=utf-8",
+          "Transfer-Encoding": "chunked",
+        },
+      });
     }
 
-    return NextResponse.json(
-      { error: "Something went wrong. Please try again." },
-      { status: 500 }
-    );
+    // Fallback to OpenAI if Gemini key is not set
+    if (openaiKey) {
+      const client = new OpenAI({ apiKey: openaiKey });
+      const completion = await client.chat.completions.create({
+        model: "gpt-4o-mini",
+        messages: [
+          { role: "system", content: SYSTEM_PROMPT },
+          ...messages,
+        ],
+        max_tokens: 350,
+        temperature: 0.7,
+      });
+
+      const reply = completion.choices[0]?.message?.content ?? "";
+      return new Response(reply, {
+        headers: { "Content-Type": "text/plain; charset=utf-8" },
+      });
+    }
+
+    return NextResponse.json({ error: "No provider available" }, { status: 500 });
+  } catch (error: unknown) {
+    console.error("Chat API error:", error);
+    const errorMessage = error instanceof Error ? error.message : "Something went wrong. Please try again.";
+    return NextResponse.json({ error: errorMessage }, { status: 500 });
   }
 }
